@@ -1,0 +1,188 @@
+# אלקטרה Star — שליטה מקומית. קריאת מצב אמיתית מ-slave 0xA0 (ממשק BMS רשמי).
+# כתיבת שליטה ל-slave 1 (מוכח; משתקף ב-0xA0). heartbeat/compressor מ-slave 1.
+modbus:
+  - name: star_ac
+    type: serial
+    method: rtu
+    port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
+    baudrate: 9600
+    bytesize: 8
+    parity: N
+    stopbits: 1
+    delay: 2
+    message_wait_milliseconds: 200
+    retries: 1
+    timeout: 5
+    sensors:
+      # ---- מצב אמיתי, slave 0xA0 (160) ----
+      - {name: "AC Mode A0",  unique_id: electra_mode_a0,  slave: 160, address: 13056, input_type: holding, data_type: int16, scan_interval: 10}
+      - {name: "AC Fan A0",   unique_id: electra_fan_a0,   slave: 160, address: 13057, input_type: holding, data_type: int16, scan_interval: 10}
+      - {name: "AC SPT A0",   unique_id: electra_spt_a0,   slave: 160, address: 13058, input_type: holding, data_type: int16, scan_interval: 10, unit_of_measurement: "°C"}
+      - {name: "AC Room A0",  unique_id: electra_room_a0,  slave: 160, address: 13059, input_type: holding, data_type: int16, scan_interval: 10, unit_of_measurement: "°C", device_class: temperature, state_class: measurement}
+      - {name: "AC IDU Fault A0", unique_id: electra_idu_fault_a0, slave: 160, address: 13060, input_type: holding, data_type: int16, scan_interval: 30}
+      - {name: "AC ODU Fault A0", unique_id: electra_odu_fault_a0, slave: 160, address: 13061, input_type: holding, data_type: int16, scan_interval: 30}
+      - {name: "AC Defrost A0",   unique_id: electra_defrost_a0,   slave: 160, address: 13071, input_type: holding, data_type: int16, scan_interval: 30}
+      - {name: "AC Overflow A0",  unique_id: electra_overflow_a0,  slave: 160, address: 13072, input_type: holding, data_type: int16, scan_interval: 30}
+      - {name: "AC Alarm A0",     unique_id: electra_alarm_a0,     slave: 160, address: 13073, input_type: holding, data_type: int16, scan_interval: 30}
+      # ---- slave 1: heartbeat + מדד מדחס ----
+      - {name: "Electra Heartbeat", unique_id: electra_heartbeat, slave: 1, address: 66, input_type: holding, data_type: uint16, scan_interval: 10}
+      - {name: "Electra Compressor", unique_id: electra_reg60, slave: 1, address: 60, input_type: holding, data_type: int16, scan_interval: 15}
+
+input_select:
+  electra_mode:
+    name: אלקטרה מצב
+    icon: mdi:air-conditioner
+    options: [כבוי, קירור, חימום, אוטו, יבש, מאוורר]
+  electra_fan:
+    name: אלקטרה מאוורר
+    icon: mdi:fan
+    options: [נמוך, בינוני, גבוה, אוטו, טורבו]
+input_number:
+  electra_temp:
+    name: אלקטרה טמפרטורה
+    icon: mdi:thermometer
+    min: 16
+    max: 30
+    step: 1
+    unit_of_measurement: "°C"
+    mode: slider
+
+script:
+  electra_apply:
+    alias: Electra Apply
+    mode: restart
+    sequence:
+      - service: modbus.write_register
+        data:
+          hub: star_ac
+          slave: 1
+          address: 13056
+          value:
+            - "{{ {'כבוי':0,'קירור':1,'חימום':2,'אוטו':3,'יבש':4,'מאוורר':5}[states('input_select.electra_mode')] | int(0) }}"
+            - "{{ {'נמוך':0,'בינוני':1,'גבוה':2,'אוטו':3,'טורבו':4}[states('input_select.electra_fan')] | int(0) }}"
+            - "{{ states('input_number.electra_temp') | int(24) }}"
+
+automation:
+  - alias: Electra Apply On Change
+    id: electra_apply_on_change
+    trigger:
+      - platform: state
+        entity_id: [input_select.electra_mode, input_select.electra_fan, input_number.electra_temp]
+    action: [{service: script.electra_apply}]
+  - alias: Electra Resend
+    id: electra_resend
+    trigger: [{platform: time_pattern, minutes: "/1"}]
+    action: [{service: script.electra_apply}]
+  - alias: Electra MQTT Mode In
+    id: electra_mqtt_mode_in
+    trigger: [{platform: mqtt, topic: electra/mode/set}]
+    action:
+      - service: input_select.select_option
+        data:
+          entity_id: input_select.electra_mode
+          option: "{{ {'off':'כבוי','cool':'קירור','heat':'חימום','dry':'יבש','fan_only':'מאוורר','auto':'אוטו'}[trigger.payload] | default('כבוי') }}"
+  - alias: Electra MQTT Temp In
+    id: electra_mqtt_temp_in
+    trigger: [{platform: mqtt, topic: electra/temp/set}]
+    action:
+      - service: input_number.set_value
+        data: {entity_id: input_number.electra_temp, value: "{{ trigger.payload | float | round(0) }}"}
+  - alias: Electra MQTT Fan In
+    id: electra_mqtt_fan_in
+    trigger: [{platform: mqtt, topic: electra/fan/set}]
+    action:
+      - service: input_select.select_option
+        data:
+          entity_id: input_select.electra_fan
+          option: "{{ {'low':'נמוך','medium':'בינוני','high':'גבוה','auto':'אוטו','turbo':'טורבו'}[trigger.payload] | default('נמוך') }}"
+  # State Out — מפרסם את המצב האמיתי מ-0xA0 לחוגה
+  - alias: Electra MQTT State Out
+    id: electra_mqtt_state_out
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: [sensor.ac_mode_a0, sensor.ac_fan_a0, sensor.ac_spt_a0, sensor.ac_room_a0]
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:00:01"
+      - service: mqtt.publish
+        data:
+          topic: electra/mode/state
+          retain: true
+          payload: "{{ {0:'off',1:'cool',2:'heat',3:'auto',4:'dry',5:'fan_only'}[states('sensor.ac_mode_a0')|int(0)] | default('off') }}"
+      - service: mqtt.publish
+        data:
+          topic: electra/fan/state
+          retain: true
+          payload: "{{ {0:'low',1:'medium',2:'high',3:'auto',4:'turbo',5:'low'}[states('sensor.ac_fan_a0')|int(0)] | default('low') }}"
+      - service: mqtt.publish
+        data: {topic: electra/temp/state, retain: true, payload: "{{ states('sensor.ac_spt_a0')|int(24) }}"}
+      - service: mqtt.publish
+        data: {topic: electra/current_temp, retain: true, payload: "{{ states('sensor.ac_room_a0')|int(24) }}"}
+  - alias: Electra Fault Alert
+    id: electra_fault_alert
+    trigger:
+      - platform: numeric_state
+        entity_id: [sensor.ac_idu_fault_a0, sensor.ac_odu_fault_a0]
+        above: 0
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "⚠️ תקלת מזגן אלקטרה"
+          message: "IDU: {{ states('sensor.electra_idu_fault_text') }} | ODU: {{ states('sensor.electra_odu_fault_text') }}"
+
+mqtt:
+  climate:
+    - name: "מזגן אלקטרה"
+      unique_id: electra_climate
+      modes: ["off", "cool", "heat", "dry", "fan_only", "auto"]
+      fan_modes: ["low", "medium", "high", "auto", "turbo"]
+      min_temp: 16
+      max_temp: 30
+      temp_step: 1
+      precision: 1.0
+      mode_command_topic: "electra/mode/set"
+      mode_state_topic: "electra/mode/state"
+      temperature_command_topic: "electra/temp/set"
+      temperature_state_topic: "electra/temp/state"
+      fan_mode_command_topic: "electra/fan/set"
+      fan_mode_state_topic: "electra/fan/state"
+      current_temperature_topic: "electra/current_temp"
+
+template:
+  - sensor:
+      - name: "Electra IDU Fault Text"
+        unique_id: electra_idu_fault_text
+        icon: mdi:alert-circle
+        state: >-
+          {% set c = states('sensor.ac_idu_fault_a0') | int(0) %}
+          {{ {0:'תקין',1:'ICT מנותק/קצר',3:'RAT מנותק/קצר',7:'דגם IDU לא מוגדר',8:'אין תקשורת',9:'אין Encoder',15:'אובדן מתח AC',21:'הגנת הצפה',24:'FLASH לא עודכן',25:'FLASH פגום'}.get(c, 'קוד ' ~ c) }}
+      - name: "Electra ODU Fault Text"
+        unique_id: electra_odu_fault_text
+        icon: mdi:alert-circle-outline
+        state: >-
+          {% set c = states('sensor.ac_odu_fault_a0') | int(0) %}
+          {{ {0:'תקין',1:'OOT/OCT קצר',8:'לחץ גבוה',9:'לחץ נמוך',10:'אין תקשורת מניע',11:'תקלת IPM/מדחס',13:'דליפת גז',14:'מתח DC חריג',15:'מתח AC חריג'}.get(c, 'קוד ' ~ c) }}
+      - name: "Electra Mode Real"
+        unique_id: electra_mode_real
+        icon: mdi:hvac
+        state: >-
+          {{ {0:'כבוי',1:'קירור',2:'חימום',3:'אוטו',4:'יבש',5:'מאוורר'}.get(states('sensor.ac_mode_a0')|int(-1),'?') }}
+  - binary_sensor:
+      - name: "Electra Comm"
+        unique_id: electra_comm
+        device_class: connectivity
+        state: "{{ has_value('sensor.electra_heartbeat') and (now() - states.sensor.electra_heartbeat.last_changed).total_seconds() < 120 }}"
+      - name: "Electra Overflow"
+        unique_id: electra_overflow
+        device_class: problem
+        state: "{{ states('sensor.ac_overflow_a0')|int(0) != 0 }}"
+      - name: "Electra Alarm"
+        unique_id: electra_alarm
+        device_class: problem
+        state: "{{ states('sensor.ac_alarm_a0')|int(0) != 0 }}"
+      - name: "Electra Defrost"
+        unique_id: electra_defrost
+        device_class: running
+        state: "{{ states('sensor.ac_defrost_a0')|int(0) != 0 }}"
